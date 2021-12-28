@@ -1,24 +1,31 @@
 use crate::{EguiSettings, WindowSize, EGUI_TRANSFORM_RESOURCE_BINDING_NAME};
 use bevy::{
     core::AsBytes,
-    ecs::{Commands, IntoSystem, Local, Res, ResMut, Resources, System, World},
+    ecs::{
+        system::{IntoSystem, Local, Res, ResMut, System},
+        world::World,
+    },
     render::{
         render_graph::{CommandQueue, Node, ResourceSlots, SystemNode},
         renderer::{
-            BufferId, BufferInfo, BufferUsage, RenderContext, RenderResourceBinding,
+            BufferId, BufferInfo, BufferMapMode, BufferUsage, RenderContext, RenderResourceBinding,
             RenderResourceBindings, RenderResourceContext,
         },
     },
+    utils::HashMap,
+    window::WindowId,
 };
 
 #[derive(Debug)]
 pub struct EguiTransformNode {
+    window_id: WindowId,
     command_queue: CommandQueue,
 }
 
 impl EguiTransformNode {
-    pub fn new() -> Self {
+    pub fn new(window_id: WindowId) -> Self {
         EguiTransformNode {
+            window_id,
             command_queue: Default::default(),
         }
     }
@@ -28,7 +35,6 @@ impl Node for EguiTransformNode {
     fn update(
         &mut self,
         _world: &World,
-        _resources: &Resources,
         render_context: &mut dyn RenderContext,
         _input: &ResourceSlots,
         _output: &mut ResourceSlots,
@@ -38,24 +44,24 @@ impl Node for EguiTransformNode {
 }
 
 impl SystemNode for EguiTransformNode {
-    fn get_system(&self, commands: &mut Commands) -> Box<dyn System<In = (), Out = ()>> {
-        let system = transform_node_system.system();
-        commands.insert_local_resource(
-            system.id(),
-            TransformNodeState {
+    fn get_system(&self) -> Box<dyn System<In = (), Out = ()>> {
+        let system = transform_node_system.system().config(|c| {
+            c.0 = Some(TransformNodeState {
+                window_id: self.window_id,
                 command_queue: self.command_queue.clone(),
                 transform_buffer: None,
                 staging_buffer: None,
                 prev_window_size: WindowSize::new(0.0, 0.0, 0.0),
                 prev_scale_factor: 0.0,
-            },
-        );
+            });
+        });
         Box::new(system)
     }
 }
 
 #[derive(Default)]
 pub struct TransformNodeState {
+    window_id: WindowId,
     command_queue: CommandQueue,
     transform_buffer: Option<BufferId>,
     staging_buffer: Option<BufferId>,
@@ -66,10 +72,12 @@ pub struct TransformNodeState {
 fn transform_node_system(
     mut state: Local<TransformNodeState>,
     render_resource_context: Res<Box<dyn RenderResourceContext>>,
-    window_size: Res<WindowSize>,
+    window_size: Res<HashMap<WindowId, WindowSize>>,
     egui_settings: Res<EguiSettings>,
     mut render_resource_bindings: ResMut<RenderResourceBindings>,
 ) {
+    let window_size = &window_size[&state.window_id];
+
     #[allow(clippy::float_cmp)]
     if state.prev_window_size == *window_size
         && state.prev_scale_factor == egui_settings.scale_factor
@@ -83,7 +91,7 @@ fn transform_node_system(
     let transform_data_size = std::mem::size_of::<[[f32; 2]; 2]>();
 
     let staging_buffer = if let Some(staging_buffer) = state.staging_buffer {
-        render_resource_context.map_buffer(staging_buffer);
+        render_resource_context.map_buffer(staging_buffer, BufferMapMode::Write);
         staging_buffer
     } else {
         let buffer = render_resource_context.create_buffer(BufferInfo {

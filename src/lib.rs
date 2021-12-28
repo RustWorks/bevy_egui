@@ -1,26 +1,25 @@
 #![deny(missing_docs)]
 
-//! This crate provides a [egui](https://github.com/emilk/egui) integration for the [Bevy](https://github.com/bevyengine/bevy) game engine.
+//! This crate provides a [Egui](https://github.com/emilk/egui) integration for the [Bevy](https://github.com/bevyengine/bevy) game engine.
+//!
+//! **Trying out:**
+//!
+//! An example WASM project is live at [mvlabat.github.io/bevy_egui_web_showcase](https://mvlabat.github.io/bevy_egui_web_showcase/index.html) [[source](https://github.com/mvlabat/bevy_egui_web_showcase)].
 //!
 //! **Features:**
 //! - Desktop and web ([bevy_webgl2](https://github.com/mrk-its/bevy_webgl2)) platforms support
 //! - Clipboard (web support is limited to the same window, see [rust-windowing/winit#1829](https://github.com/rust-windowing/winit/issues/1829))
 //! - Opening URLs
+//! - Multiple windows support (see [./examples/two_windows.rs](./examples/two_windows.rs))
 //!
 //! `bevy_egui` can be compiled with using only `bevy` and `egui` as dependencies: `manage_clipboard` and `open_url` features,
 //! that require additional crates, can be disabled.
-//!
-//! ## Trying out
-//!
-//! An example WASM project is live at [mvlabat.github.io/bevy_egui_web_showcase](https://mvlabat.github.io/bevy_egui_web_showcase/index.html) [[source](https://github.com/mvlabat/bevy_egui_web_showcase)].
-//!
-//! **Note** that in order to use `bevy_egui`in WASM you need [bevy_webgl2](https://github.com/mrk-its/bevy_webgl2) of at least `0.4.1` version.
 //!
 //! ## Usage
 //!
 //! Here's a minimal usage example:
 //!
-//! ```no_run
+//! ```no_run,rust
 //! use bevy::prelude::*;
 //! use bevy_egui::{egui, EguiContext, EguiPlugin};
 //!
@@ -32,9 +31,11 @@
 //!         .run();
 //! }
 //!
-//! fn ui_example(mut egui_context: ResMut<EguiContext>) {
-//!     let ctx = &mut egui_context.ctx;
-//!     egui::Window::new("Hello").show(ctx, |ui| {
+//! // Note the usage of `ResMut`. Even though `ctx` method doesn't require
+//! // mutability, accessing the context from different threads will result
+//! // into panic if you don't enable `egui/multi_threaded` feature.
+//! fn ui_example(egui_context: Res<EguiContext>) {
+//!     egui::Window::new("Hello").show(egui_context.ctx(), |ui| {
 //!         ui.label("world");
 //!     });
 //! }
@@ -43,11 +44,12 @@
 //! For a more advanced example, see [examples/ui.rs](examples/ui.rs).
 //!
 //! ```bash
-//! cargo run --example ui --features="bevy/x11 bevy/png bevy/bevy_wgpu"
+//! cargo run --example ui
 //! ```
 //!
 //! ## See also
 //!
+//! - [`bevy-inspector-egui`](https://github.com/jakobhellermann/bevy-inspector-egui)
 //! - [`bevy_megaui`](https://github.com/mvlabat/bevy_megaui)
 
 pub use egui;
@@ -58,35 +60,37 @@ mod transform_node;
 
 use crate::{egui_node::EguiNode, systems::*, transform_node::EguiTransformNode};
 use bevy::{
-    app::{stage as bevy_stage, AppBuilder, EventReader, Plugin},
+    app::{AppBuilder, CoreStage, Plugin, StartupStage},
     asset::{Assets, Handle, HandleUntyped},
-    ecs::{IntoSystem, SystemStage},
-    input::mouse::MouseWheel,
+    ecs::{
+        schedule::{ParallelSystemDescriptorCoercion, StageLabel, SystemLabel, SystemStage},
+        system::IntoSystem,
+    },
+    input::InputSystem,
     log,
     reflect::TypeUuid,
     render::{
         pipeline::{
-            BlendDescriptor, BlendFactor, BlendOperation, ColorStateDescriptor, ColorWrite,
-            CompareFunction, CullMode, DepthStencilStateDescriptor, FrontFace, IndexFormat,
-            PipelineDescriptor, RasterizationStateDescriptor, StencilStateDescriptor,
-            StencilStateFaceDescriptor,
+            BlendFactor, BlendOperation, BlendState, ColorTargetState, ColorWrite, CompareFunction,
+            CullMode, DepthBiasState, DepthStencilState, FrontFace, MultisampleState,
+            PipelineDescriptor, PrimitiveState, StencilFaceState, StencilState,
         },
         render_graph::{base, base::Msaa, RenderGraph, WindowSwapChainNode, WindowTextureNode},
         shader::{Shader, ShaderStage, ShaderStages},
-        stage as bevy_render_stage,
         texture::{Texture, TextureFormat},
+        RenderStage,
     },
-    window::{CursorLeft, CursorMoved, ReceivedCharacter},
+    utils::HashMap,
+    window::WindowId,
 };
 #[cfg(all(feature = "manage_clipboard", not(target_arch = "wasm32")))]
 use clipboard::{ClipboardContext, ClipboardProvider};
 #[cfg(all(feature = "manage_clipboard", not(target_arch = "wasm32")))]
 use std::cell::{RefCell, RefMut};
-use std::collections::HashMap;
 #[cfg(all(feature = "manage_clipboard", not(target_arch = "wasm32")))]
 use thread_local::ThreadLocal;
 
-/// A handle pointing to the egui [PipelineDescriptor].
+/// A handle pointing to the egui [`PipelineDescriptor`].
 pub const EGUI_PIPELINE_HANDLE: HandleUntyped =
     HandleUntyped::weak_from_u64(PipelineDescriptor::TYPE_UUID, 9404026720151354217);
 /// Name of the transform uniform.
@@ -94,10 +98,10 @@ pub const EGUI_TRANSFORM_RESOURCE_BINDING_NAME: &str = "EguiTransform";
 /// Name of the texture uniform.
 pub const EGUI_TEXTURE_RESOURCE_BINDING_NAME: &str = "EguiTexture_texture";
 
-/// Adds all egui resources and render graph nodes.
+/// Adds all Egui resources and render graph nodes.
 pub struct EguiPlugin;
 
-/// A resource containing global UI settings.
+/// A resource for storing global UI settings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EguiSettings {
     /// Global scale factor for egui widgets (`1.0` by default).
@@ -122,8 +126,9 @@ impl Default for EguiSettings {
     }
 }
 
-/// A resource that stores the input passed to Egui.
-/// It gets reset during the [stage::UI_FRAME] stage.
+/// Is used for storing the input passed to Egui. The actual resource is a [`HashMap<WindowId, EguiInput>`].
+///
+/// It gets reset during the [`EguiSystem::ProcessInput`] system.
 #[derive(Clone, Debug, Default)]
 pub struct EguiInput {
     /// Egui's raw input.
@@ -131,7 +136,8 @@ pub struct EguiInput {
 }
 
 /// A resource for accessing clipboard.
-/// Is available only if `manage_clipboard` feature is enabled.
+///
+/// The resource is available only if `manage_clipboard` feature is enabled.
 #[cfg(feature = "manage_clipboard")]
 #[derive(Default)]
 pub struct EguiClipboard {
@@ -148,7 +154,7 @@ impl EguiClipboard {
         self.set_contents_impl(contents);
     }
 
-    /// Gets clipboard contents. Returns [None] if clipboard provider is unavailable or returns an error.
+    /// Gets clipboard contents. Returns [`None`] if clipboard provider is unavailable or returns an error.
     pub fn get_contents(&self) -> Option<String> {
         self.get_contents_impl()
     }
@@ -200,46 +206,64 @@ impl EguiClipboard {
     }
 }
 
+/// Is used for storing Egui shapes. The actual resource is [`HashMap<WindowId, EguiShapes>`].
 #[derive(Clone, Default)]
-/// A resource for storing Egui shapes.
 pub struct EguiShapes {
     /// Pairs of rectangles and paint commands.
     ///
-    /// The field gets populated during the [stage::UI_FRAME_END] stage and reset during `EguiNode::update`.
+    /// The field gets populated during the [`EguiStage::UiFrameEnd`] stage and reset during `EguiNode::update`.
     pub shapes: Vec<egui::paint::ClippedShape>,
 }
 
-/// A resource for storing Egui output.
+/// Is used for storing Egui output. The actual resource is [`HashMap<WindowId, EguiOutput>`].
 #[derive(Clone, Default)]
 pub struct EguiOutput {
-    /// The field gets updated during the [stage::UI_FRAME_END] stage.
+    /// The field gets updated during the [`EguiStage::UiFrameEnd`] stage.
     pub output: egui::Output,
 }
 
-/// A resource that is used to store `bevy_egui` context.
+/// A resource for storing `bevy_egui` context.
 pub struct EguiContext {
-    /// Egui context.
-    pub ctx: egui::CtxRef,
+    ctx: HashMap<WindowId, egui::CtxRef>,
     egui_textures: HashMap<egui::TextureId, Handle<Texture>>,
-
     mouse_position: Option<(f32, f32)>,
-    cursor_left: EventReader<CursorLeft>,
-    cursor_moved: EventReader<CursorMoved>,
-    mouse_wheel: EventReader<MouseWheel>,
-    received_character: EventReader<ReceivedCharacter>,
 }
 
 impl EguiContext {
     fn new() -> Self {
         Self {
-            ctx: Default::default(),
+            ctx: HashMap::default(),
             egui_textures: Default::default(),
             mouse_position: Some((0.0, 0.0)),
-            cursor_left: Default::default(),
-            cursor_moved: Default::default(),
-            mouse_wheel: Default::default(),
-            received_character: Default::default(),
         }
+    }
+
+    /// Egui context of the primary window.
+    ///
+    /// Note: accessing the context from different threads simultaneously requires enabling
+    /// `egui/multi_threaded` feature.
+    #[track_caller]
+    pub fn ctx(&self) -> &egui::CtxRef {
+        self.ctx.get(&WindowId::primary()).expect("`EguiContext::ctx` was called for an uninitialized context (primary window), consider moving your startup system to `StartupStage::Startup` stage or run it after `EguiStartupSystem::InitContexts` system")
+    }
+
+    /// Egui context for a specific window.
+    /// If you want to display UI on a non-primary window,
+    /// make sure to set up the render graph by calling [`setup_pipeline`].
+    ///
+    /// Note: accessing the context from different threads simultaneously requires enabling
+    /// `egui/multi_threaded` feature.
+    #[track_caller]
+    pub fn ctx_for_window(&self, window: WindowId) -> &egui::CtxRef {
+        self.ctx
+            .get(&window)
+            .ok_or_else(|| format!("`EguiContext::ctx_for_window` was called for an uninitialized context (window {}), consider moving your UI system to `CoreStage::Update` or run it after `EguiSystem::BeginFrame` system (`StartupStage::Startup` or `EguiStartupSystem::InitContexts` for startup systems respectively)", window))
+            .unwrap()
+    }
+
+    /// Fallible variant of [`EguiContext::ctx_for_window`]. Make sure to set up the render graph by calling [`setup_pipeline`].
+    pub fn try_ctx_for_window(&self, window: WindowId) -> Option<&egui::CtxRef> {
+        self.ctx.get(&window)
     }
 
     /// Can accept either a strong or a weak handle.
@@ -310,142 +334,218 @@ pub mod node {
 }
 
 /// The names of `bevy_egui` stages.
-pub mod stage {
-    /// Runs after [bevy::app::stage::EVENT]. This is where `bevy_egui` translates Bevy's input events to Egui.
-    pub const INPUT: &str = "input";
-    /// Runs after [INPUT].
-    pub const POST_INPUT: &str = "post_input";
-    /// Runs after [POST_INPUT]. All Egui widgets should be added during or after this stage and before [UI_FRAME_END].
-    pub const UI_FRAME: &str = "ui_frame";
-    /// Runs before [bevy::render::stage::RENDER_RESOURCE]. This is where we read Egui's output.
-    pub const UI_FRAME_END: &str = "ui_frame_end";
-    /// Runs after [UI_FRAME_END].
-    pub const POST_UI_FRAME_END: &str = "post_ui_frame_end";
+#[derive(StageLabel, Clone, Hash, Debug, Eq, PartialEq)]
+pub enum EguiStage {
+    /// Runs before [`bevy::render::RenderStage::RenderResource`]. This is where we read Egui's output.
+    UiFrameEnd,
+}
+
+/// The names of `bevy_egui` startup stages.
+#[derive(SystemLabel, Clone, Hash, Debug, Eq, PartialEq)]
+pub enum EguiStartupSystem {
+    /// Initializes Egui contexts for available windows.
+    InitContexts,
+}
+
+/// The names of egui systems.
+#[derive(SystemLabel, Clone, Hash, Debug, Eq, PartialEq)]
+pub enum EguiSystem {
+    /// Reads Egui inputs (keyboard, mouse, etc) and writes them into the [`EguiInput`] resource.
+    ///
+    /// To modify the input, you can hook your system like this:
+    ///
+    /// `system.after(EguiSystem::ProcessInput).before(EguiSystem::BeginFrame)`.
+    ProcessInput,
+    /// Begins the `egui` frame
+    BeginFrame,
+    /// Processes the [`EguiOutput`] resource
+    ProcessOutput,
 }
 
 impl Plugin for EguiPlugin {
     fn build(&self, app: &mut AppBuilder) {
-        app.add_stage_after(bevy_stage::EVENT, stage::INPUT, SystemStage::parallel());
-        app.add_stage_after(stage::INPUT, stage::POST_INPUT, SystemStage::parallel());
-        app.add_stage_after(stage::POST_INPUT, stage::UI_FRAME, SystemStage::parallel());
+        app.add_startup_system_to_stage(
+            StartupStage::PreStartup,
+            init_contexts_on_startup
+                .system()
+                .label(EguiStartupSystem::InitContexts),
+        );
+
         app.add_stage_before(
-            bevy_render_stage::RENDER_RESOURCE,
-            stage::UI_FRAME_END,
-            SystemStage::parallel(),
-        );
-        app.add_stage_after(
-            stage::UI_FRAME_END,
-            stage::POST_UI_FRAME_END,
+            RenderStage::RenderResource,
+            EguiStage::UiFrameEnd,
             SystemStage::parallel(),
         );
 
-        app.add_system_to_stage(stage::INPUT, process_input.system());
-        app.add_system_to_stage(stage::UI_FRAME, begin_frame.system());
-        app.add_system_to_stage(stage::UI_FRAME_END, process_output.system());
+        app.add_system_to_stage(
+            CoreStage::PreUpdate,
+            process_input
+                .system()
+                .label(EguiSystem::ProcessInput)
+                .after(InputSystem),
+        );
+        app.add_system_to_stage(
+            CoreStage::PreUpdate,
+            begin_frame
+                .system()
+                .label(EguiSystem::BeginFrame)
+                .after(EguiSystem::ProcessInput),
+        );
+        app.add_system_to_stage(
+            EguiStage::UiFrameEnd,
+            process_output.system().label(EguiSystem::ProcessOutput),
+        );
 
-        let resources = app.resources_mut();
-        resources.get_or_insert_with(EguiSettings::default);
-        resources.get_or_insert_with(EguiInput::default);
-        resources.get_or_insert_with(EguiOutput::default);
-        resources.get_or_insert_with(EguiShapes::default);
+        let world = app.world_mut();
+        world.get_resource_or_insert_with(EguiSettings::default);
+        world.get_resource_or_insert_with(HashMap::<WindowId, EguiInput>::default);
+        world.get_resource_or_insert_with(HashMap::<WindowId, EguiOutput>::default);
+        world.get_resource_or_insert_with(HashMap::<WindowId, WindowSize>::default);
+        world.get_resource_or_insert_with(HashMap::<WindowId, EguiShapes>::default);
         #[cfg(feature = "manage_clipboard")]
-        resources.get_or_insert_with(EguiClipboard::default);
-        resources.insert(EguiContext::new());
-        resources.insert(WindowSize::new(0.0, 0.0, 0.0));
+        world.get_resource_or_insert_with(EguiClipboard::default);
+        world.insert_resource(EguiContext::new());
 
-        let mut pipelines = resources.get_mut::<Assets<PipelineDescriptor>>().unwrap();
-        let mut shaders = resources.get_mut::<Assets<Shader>>().unwrap();
-        let msaa = resources.get::<Msaa>().unwrap();
+        let world = world.cell();
+
+        let mut pipelines = world
+            .get_resource_mut::<Assets<PipelineDescriptor>>()
+            .unwrap();
+        let msaa = world.get_resource::<Msaa>().unwrap();
+        let mut shaders = world.get_resource_mut::<Assets<Shader>>().unwrap();
 
         pipelines.set_untracked(
             EGUI_PIPELINE_HANDLE,
             build_egui_pipeline(&mut shaders, msaa.samples),
         );
-        let mut render_graph = resources.get_mut::<RenderGraph>().unwrap();
 
-        render_graph.add_node(node::EGUI_PASS, EguiNode::new(&msaa));
-        render_graph
-            .add_node_edge(base::node::MAIN_PASS, node::EGUI_PASS)
-            .unwrap();
+        let mut render_graph = world.get_resource_mut::<RenderGraph>().unwrap();
+        setup_pipeline(&mut render_graph, &msaa, RenderGraphConfig::default());
+    }
+}
 
-        render_graph
-            .add_slot_edge(
-                base::node::PRIMARY_SWAP_CHAIN,
-                WindowSwapChainNode::OUT_TEXTURE,
-                node::EGUI_PASS,
-                if msaa.samples > 1 {
-                    "color_resolve_target"
-                } else {
-                    "color_attachment"
-                },
-            )
-            .unwrap();
+/// Egui's render graph config.
+#[allow(missing_docs)]
+pub struct RenderGraphConfig {
+    pub window_id: WindowId,
+    pub egui_pass: &'static str,
+    pub main_pass: &'static str,
+    pub swap_chain_node: &'static str,
+    pub depth_texture: &'static str,
+    pub sampled_color_attachment: &'static str,
+    pub transform_node: &'static str,
+}
 
-        render_graph
-            .add_slot_edge(
-                base::node::MAIN_DEPTH_TEXTURE,
-                WindowTextureNode::OUT_TEXTURE,
-                node::EGUI_PASS,
-                "depth",
-            )
-            .unwrap();
-
-        if msaa.samples > 1 {
-            render_graph
-                .add_slot_edge(
-                    base::node::MAIN_SAMPLED_COLOR_ATTACHMENT,
-                    WindowSwapChainNode::OUT_TEXTURE,
-                    node::EGUI_PASS,
-                    "color_attachment",
-                )
-                .unwrap();
+impl Default for RenderGraphConfig {
+    fn default() -> Self {
+        RenderGraphConfig {
+            window_id: WindowId::primary(),
+            egui_pass: node::EGUI_PASS,
+            main_pass: base::node::MAIN_PASS,
+            swap_chain_node: base::node::PRIMARY_SWAP_CHAIN,
+            depth_texture: base::node::MAIN_DEPTH_TEXTURE,
+            sampled_color_attachment: base::node::MAIN_SAMPLED_COLOR_ATTACHMENT,
+            transform_node: node::EGUI_TRANSFORM,
         }
+    }
+}
 
-        // Transform.
-        render_graph.add_system_node(node::EGUI_TRANSFORM, EguiTransformNode::new());
+/// Set up egui render pipeline.
+///
+/// The pipeline for the primary window will already be set up by the [`EguiPlugin`],
+/// so you'll only need to manually call this if you want to use multiple windows.
+pub fn setup_pipeline(render_graph: &mut RenderGraph, msaa: &Msaa, config: RenderGraphConfig) {
+    render_graph.add_node(config.egui_pass, EguiNode::new(msaa, config.window_id));
+    render_graph
+        .add_node_edge(config.main_pass, config.egui_pass)
+        .unwrap();
+    if let Ok(ui_pass) = render_graph.get_node_id(bevy::ui::node::UI_PASS) {
         render_graph
-            .add_node_edge(node::EGUI_TRANSFORM, node::EGUI_PASS)
+            .add_node_edge(ui_pass, config.egui_pass)
             .unwrap();
     }
+    render_graph
+        .add_slot_edge(
+            config.swap_chain_node,
+            WindowSwapChainNode::OUT_TEXTURE,
+            config.egui_pass,
+            if msaa.samples > 1 {
+                "color_resolve_target"
+            } else {
+                "color_attachment"
+            },
+        )
+        .unwrap();
+    render_graph
+        .add_slot_edge(
+            config.depth_texture,
+            WindowTextureNode::OUT_TEXTURE,
+            config.egui_pass,
+            "depth",
+        )
+        .unwrap();
+    if msaa.samples > 1 {
+        render_graph
+            .add_slot_edge(
+                config.sampled_color_attachment,
+                WindowSwapChainNode::OUT_TEXTURE,
+                config.egui_pass,
+                "color_attachment",
+            )
+            .unwrap();
+    }
+    render_graph.add_system_node(
+        config.transform_node,
+        EguiTransformNode::new(config.window_id),
+    );
+    render_graph
+        .add_node_edge(config.transform_node, config.egui_pass)
+        .unwrap();
 }
 
 fn build_egui_pipeline(shaders: &mut Assets<Shader>, sample_count: u32) -> PipelineDescriptor {
     PipelineDescriptor {
-        rasterization_state: Some(RasterizationStateDescriptor {
+        primitive: PrimitiveState {
             front_face: FrontFace::Cw,
             cull_mode: CullMode::None,
-            depth_bias: 0,
-            depth_bias_slope_scale: 0.0,
-            depth_bias_clamp: 0.0,
-            clamp_depth: false,
-        }),
-        depth_stencil_state: Some(DepthStencilStateDescriptor {
+            ..Default::default()
+        },
+        depth_stencil: Some(DepthStencilState {
             format: TextureFormat::Depth32Float,
             depth_write_enabled: true,
             depth_compare: CompareFunction::LessEqual,
-            stencil: StencilStateDescriptor {
-                front: StencilStateFaceDescriptor::IGNORE,
-                back: StencilStateFaceDescriptor::IGNORE,
+            stencil: StencilState {
+                front: StencilFaceState::IGNORE,
+                back: StencilFaceState::IGNORE,
                 read_mask: 0,
                 write_mask: 0,
             },
+            bias: DepthBiasState {
+                constant: 0,
+                slope_scale: 0.0,
+                clamp: 0.0,
+            },
+            clamp_depth: false,
         }),
-        color_states: vec![ColorStateDescriptor {
+        color_target_states: vec![ColorTargetState {
             format: TextureFormat::default(),
-            color_blend: BlendDescriptor {
+            color_blend: BlendState {
                 src_factor: BlendFactor::One,
                 dst_factor: BlendFactor::OneMinusSrcAlpha,
                 operation: BlendOperation::Add,
             },
-            alpha_blend: BlendDescriptor {
+            alpha_blend: BlendState {
                 src_factor: BlendFactor::One,
                 dst_factor: BlendFactor::OneMinusSrcAlpha,
                 operation: BlendOperation::Add,
             },
             write_mask: ColorWrite::ALL,
         }],
-        index_format: IndexFormat::Uint32,
-        sample_count,
+        multisample: MultisampleState {
+            count: sample_count,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
         ..PipelineDescriptor::new(ShaderStages {
             vertex: shaders.add(Shader::from_glsl(
                 ShaderStage::Vertex,

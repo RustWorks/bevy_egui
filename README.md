@@ -8,21 +8,28 @@
 
 This crate provides a [Egui](https://github.com/emilk/egui) integration for the [Bevy](https://github.com/bevyengine/bevy) game engine.
 
+**Trying out:**
+
+An example WASM project is live at [mvlabat.github.io/bevy_egui_web_showcase](https://mvlabat.github.io/bevy_egui_web_showcase/index.html) [[source](https://github.com/mvlabat/bevy_egui_web_showcase)].
+
 **Features:**
 - Desktop and web ([bevy_webgl2](https://github.com/mrk-its/bevy_webgl2)) platforms support
 - Clipboard (web support is limited to the same window, see [rust-windowing/winit#1829](https://github.com/rust-windowing/winit/issues/1829))
 - Opening URLs
+- Multiple windows support (see [./examples/two_windows.rs](./examples/two_windows.rs))
 
 `bevy_egui` can be compiled with using only `bevy` and `egui` as dependencies: `manage_clipboard` and `open_url` features,
 that require additional crates, can be disabled.
 
 ![bevy_egui](bevy_egui.png)
 
-## Trying out
+## Dependencies
 
-An example WASM project is live at [mvlabat.github.io/bevy_egui_web_showcase](https://mvlabat.github.io/bevy_egui_web_showcase/index.html) [[source](https://github.com/mvlabat/bevy_egui_web_showcase)].
+On Linux, this crate requires certain parts of [XCB](https://xcb.freedesktop.org/) are installed on your system. On Debian-based systems, these can be installed with the command:
 
-**Note** that in order to use `bevy_egui`in WASM you need [bevy_webgl2](https://github.com/mrk-its/bevy_webgl2) of at least `0.4.1` version.
+```
+$ sudo apt install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+```
 
 ## Usage
 
@@ -30,8 +37,8 @@ Here's a minimal usage example:
 ```toml
 # Cargo.toml
 [dependencies]
-bevy = "0.4"
-bevy_egui = "0.3"
+bevy = "0.5"
+bevy_egui = "0.8"
 ```
 
 ```rust
@@ -46,9 +53,11 @@ fn main() {
         .run();
 }
 
-fn ui_example(mut egui_context: ResMut<EguiContext>) {
-    let ctx = &mut egui_context.ctx;
-    egui::Window::new("Hello").show(ctx, |ui| {
+// Note the usage of `ResMut`. Even though `ctx` method doesn't require
+// mutability, accessing the context from different threads will result
+// into panic if you don't enable `egui/multi_threaded` feature.
+fn ui_example(egui_context: ResMut<EguiContext>) {
+    egui::Window::new("Hello").show(egui_context.ctx(), |ui| {
         ui.label("world");
     });
 }
@@ -57,10 +66,17 @@ fn ui_example(mut egui_context: ResMut<EguiContext>) {
 For a more advanced example, see [examples/ui.rs](examples/ui.rs).
 
 ```bash
-cargo run --example ui --features="bevy/x11 bevy/png bevy/bevy_wgpu"
+cargo run --example ui
 ```
 
 ## See also
 
 - [`jakobhellermann/bevy-inspector-egui`](https://github.com/jakobhellermann/bevy-inspector-egui)
 - [`mvlabat/bevy_megaui`](https://github.com/mvlabat/bevy_megaui)
+
+## Bevy support table
+
+|bevy|bevy_egui|
+|---|---|
+|0.5|0.4-0.8|
+|0.4|0.1-0.3|
